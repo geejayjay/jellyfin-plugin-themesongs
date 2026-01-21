@@ -5,7 +5,9 @@ namespace Jellyfin.Plugin.ThemeSongs.Configuration
     public class PluginConfiguration : BasePluginConfiguration
     {
         public bool NormalizeAudio { get; set; } = true;
-        public int NormalizeAudioVolume { get; set; } = -15;
+        public int NormalizeAudioVolume { get; set; } = -18;
+        public int FadeInDuration { get; set; } = 3;
+        public int FadeOutDuration { get; set; } = 3;
         public string FfmpegPath { get; set; } = "ffmpeg";
 
         // Provider configuration

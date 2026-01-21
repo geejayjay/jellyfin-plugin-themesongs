@@ -183,7 +183,38 @@ namespace Jellyfin.Plugin.ThemeSongs.Services
                 File.Delete(outputPath);
             }
 
-            string arguments = $"-i \"{inputFilePath}\" -af \"volume=-1dB, loudnorm\" -y \"{outputPath}\"";
+            var config = Plugin.Instance?.Configuration;
+            int fadeIn = config?.FadeInDuration ?? 3;
+            int fadeOut = config?.FadeOutDuration ?? 3;
+
+            double duration = await GetAudioDurationAsync(inputFilePath);
+            
+            // Safety check: ensure fades don't exceed 25% of duration each
+            if (duration > 0)
+            {
+                double maxFade = duration * 0.25;
+                fadeIn = (int)Math.Min(fadeIn, maxFade);
+                fadeOut = (int)Math.Min(fadeOut, maxFade);
+            }
+            else
+            {
+                // If duration detection failed, use minimal fades as safety
+                fadeIn = Math.Min(fadeIn, 1);
+                fadeOut = Math.Min(fadeOut, 1);
+            }
+
+            double fadeOutStart = Math.Max(0, duration - fadeOut);
+
+            // Filter chain: 
+            // 1. Remove silence from start/end
+            // 2. Normalize volume (loudnorm)
+            // 3. Apply half-sine (hsin) fades for smoother transitions
+            string filters = $"silenceremove=start_periods=1:start_silence=0.1:start_threshold=-50dB:stop_periods=1:stop_silence=0.1:stop_threshold=-50dB, " +
+                             $"volume=-1dB, loudnorm, " +
+                             $"afade=t=in:st=0:d={fadeIn}:curve=hsin, " +
+                             $"afade=t=out:st={fadeOutStart:F2}:d={fadeOut}:curve=hsin";
+            
+            string arguments = $"-i \"{inputFilePath}\" -af \"{filters}\" -y \"{outputPath}\"";
 
             var processInfo = new ProcessStartInfo
             {
@@ -238,6 +269,50 @@ namespace Jellyfin.Plugin.ThemeSongs.Services
             }
 
             throw new InvalidOperationException("Could not extract volume information from FFmpeg output");
+        }
+
+        private async Task<double> GetAudioDurationAsync(string filePath)
+        {
+            string ffmpegPath = GetFfmpegPath();
+            string ffprobePath;
+            
+            // If ffmpeg is just a command name (not a path), assume ffprobe is also in PATH
+            if (!ffmpegPath.Contains(Path.DirectorySeparatorChar) && !ffmpegPath.Contains(Path.AltDirectorySeparatorChar))
+            {
+                ffprobePath = "ffprobe";
+            }
+            else
+            {
+                // Extract directory from ffmpeg path and construct ffprobe path
+                string directory = Path.GetDirectoryName(ffmpegPath);
+                ffprobePath = Path.Combine(directory, "ffprobe");
+            }
+            
+            string arguments = $"-v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"{filePath}\"";
+
+            var processInfo = new ProcessStartInfo
+            {
+                FileName = ffprobePath,
+                Arguments = arguments,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            using var process = new Process { StartInfo = processInfo };
+            process.Start();
+
+            string output = (await process.StandardOutput.ReadToEndAsync()).Trim();
+            await process.WaitForExitAsync();
+
+            if (double.TryParse(output, NumberStyles.Float, CultureInfo.InvariantCulture, out double duration))
+            {
+                return duration;
+            }
+
+            _logger.LogWarning("Failed to retrieve audio duration for {FilePath}. Output: {Output}", filePath, output);
+            return 0; // Return 0 as fallback
         }
 
         private bool IsVolumeAlreadyNormalized(string targetVolume, string currentVolume)
