@@ -53,13 +53,13 @@ namespace Jellyfin.Plugin.ThemeSongs.Api
         [HttpPost("DownloadTVShows")]
         [ProducesResponseType(StatusCodes.Status204NoContent)]
         [ProducesResponseType(StatusCodes.Status500InternalServerError)]
-        public async Task<ActionResult> DownloadTVThemeSongsAsync(CancellationToken cancellationToken = default)
+        public async Task<ActionResult> DownloadTVThemeSongsAsync([FromQuery] bool forceDownload = false, CancellationToken cancellationToken = default)
         {
             _logger.LogInformation("Starting TV theme songs download via API");
 
             try
             {
-                await _downloadService.DownloadAllThemeSongsAsync(cancellationToken);
+                await _downloadService.DownloadAllThemeSongsAsync(forceDownload, cancellationToken);
                 _logger.LogInformation("TV theme songs download completed successfully");
                 return NoContent();
             }

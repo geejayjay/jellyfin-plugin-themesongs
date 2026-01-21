@@ -108,8 +108,12 @@
                         <span>Save Configuration</span>
                     </button>
                     <br />
-                    <button type="button" is="emby-button" class="raised block emby-button" id="refresh-library" onclick="download()">
+                    <button type="button" is="emby-button" class="raised block emby-button" id="refresh-library" onclick="download(false)">
                         <span>Download Theme Songs</span>
+                    </button>
+                    <br />
+                    <button type="button" is="emby-button" class="raised block emby-button" id="force-refresh-library" onclick="download(true)">
+                        <span>Force Download Theme Songs</span>
                     </button>
                 </form>
                 </div>
@@ -370,14 +374,20 @@
                 }
             });
 
-            function download() {
+            function download(forceDownload) {
+                var url = ApiClient.getUrl('/ThemeSongs/DownloadTVShows');
+                if (forceDownload) {
+                    url += '?forceDownload=true';
+                }
+
                 var request = {
-                    url: ApiClient.getUrl('/ThemeSongs/DownloadTVShows'),
+                    url: url,
                     type: 'POST'
                 };
 
                 ApiClient.fetch(request).then(function () {
-                    Dashboard.alert("Downloading Theme Songs...");
+                    var message = forceDownload ? "Force Downloading Theme Songs..." : "Downloading Theme Songs...";
+                    Dashboard.alert(message);
                 }).catch(function () {
                     Dashboard.alert({
                         message: "Unexpected error occurred!"

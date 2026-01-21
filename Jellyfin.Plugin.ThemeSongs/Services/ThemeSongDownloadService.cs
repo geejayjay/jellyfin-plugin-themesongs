@@ -40,11 +40,28 @@ namespace Jellyfin.Plugin.ThemeSongs.Services
             _cachePath = cachePath ?? throw new ArgumentNullException(nameof(cachePath));
         }
 
-        public async Task DownloadAllThemeSongsAsync(CancellationToken cancellationToken = default)
+        public async Task DownloadAllThemeSongsAsync(bool forceDownload = false, CancellationToken cancellationToken = default)
         {
-            _logger.LogInformation("Starting theme song download for all series");
+            _logger.LogInformation("Starting theme song download for all series (Force Download: {ForceDownload})", forceDownload);
 
-            var seriesList = GetSeriesFromLibrary();
+            var allSeries = _libraryManager.GetItemList(new InternalItemsQuery
+            {
+                IncludeItemTypes = [BaseItemKind.Series],
+                IsVirtualItem = false,
+                Recursive = true,
+                HasTvdbId = true
+            }).OfType<Series>().ToList();
+
+            var seriesWithThemes = allSeries.Where(s => s.GetThemeSongs().Any()).ToList();
+            var seriesWithoutThemes = allSeries.Where(s => !s.GetThemeSongs().Any()).ToList();
+
+            _logger.LogInformation("Library Stats: Total Series: {Total}, With Themes: {WithThemes}, Without Themes: {WithoutThemes}",
+                allSeries.Count, seriesWithThemes.Count, seriesWithoutThemes.Count);
+
+            var seriesList = forceDownload ? allSeries : seriesWithoutThemes;
+
+            _logger.LogInformation("Processing {Count} series for theme song downloads", seriesList.Count);
+
             int processedCount = 0;
             int successCount = 0;
 
@@ -58,7 +75,7 @@ namespace Jellyfin.Plugin.ThemeSongs.Services
 
                 try
                 {
-                    bool success = await DownloadThemeSongForSeriesAsync(series, cancellationToken);
+                    bool success = await DownloadThemeSongForSeriesAsync(series, forceDownload, cancellationToken);
                     if (success)
                     {
                         successCount++;
@@ -76,7 +93,7 @@ namespace Jellyfin.Plugin.ThemeSongs.Services
                 processedCount, successCount);
         }
 
-        public async Task<bool> DownloadThemeSongForSeriesAsync(Series series, CancellationToken cancellationToken = default)
+        public async Task<bool> DownloadThemeSongForSeriesAsync(Series series, bool forceDownload = false, CancellationToken cancellationToken = default)
         {
             if (series == null)
             {
@@ -84,7 +101,7 @@ namespace Jellyfin.Plugin.ThemeSongs.Services
             }
 
             // Check if series already has theme songs
-            if (series.GetThemeSongs().Any())
+            if (!forceDownload && series.GetThemeSongs().Any())
             {
                 _logger.LogDebug("Series {SeriesName} already has theme songs, skipping", series.Name);
                 return false;
@@ -300,8 +317,7 @@ namespace Jellyfin.Plugin.ThemeSongs.Services
                 IncludeItemTypes = [BaseItemKind.Series],
                 IsVirtualItem = false,
                 Recursive = true,
-                HasTvdbId = true,
-                HasThemeSong = false,
+                HasTvdbId = true
             }).OfType<Series>();
         }
     }

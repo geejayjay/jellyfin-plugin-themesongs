@@ -19,13 +19,13 @@ namespace Jellyfin.Plugin.ThemeSongs
             _timer = new Timer(_ => OnTimerElapsed(), null, Timeout.Infinite, Timeout.Infinite);
         }
 
-        public async Task DownloadAllThemeSongsAsync(CancellationToken cancellationToken = default)
+        public async Task DownloadAllThemeSongsAsync(bool forceDownload = false, CancellationToken cancellationToken = default)
         {
             _logger.LogInformation("Starting theme song download process");
 
             try
             {
-                await _downloadService.DownloadAllThemeSongsAsync(cancellationToken);
+                await _downloadService.DownloadAllThemeSongsAsync(forceDownload, cancellationToken);
                 _logger.LogInformation("Theme song download process completed");
             }
             catch (Exception ex)

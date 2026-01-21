@@ -6,7 +6,7 @@ namespace Jellyfin.Plugin.ThemeSongs.Services
 {
     public interface IThemeSongDownloadService
     {
-        Task DownloadAllThemeSongsAsync(CancellationToken cancellationToken = default);
-        Task<bool> DownloadThemeSongForSeriesAsync(Series series, CancellationToken cancellationToken = default);
+        Task DownloadAllThemeSongsAsync(bool forceDownload = false, CancellationToken cancellationToken = default);
+        Task<bool> DownloadThemeSongForSeriesAsync(Series series, bool forceDownload = false, CancellationToken cancellationToken = default);
     }
 }

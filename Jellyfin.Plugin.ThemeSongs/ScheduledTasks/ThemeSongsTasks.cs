@@ -25,7 +25,7 @@ namespace Jellyfin.Plugin.ThemeSongs.ScheduledTasks
 
             try
             {
-                await _downloadService.DownloadAllThemeSongsAsync(cancellationToken);
+                await _downloadService.DownloadAllThemeSongsAsync(false, cancellationToken);
                 _logger.LogInformation("Scheduled theme songs download task completed successfully");
             }
             catch (OperationCanceledException)
