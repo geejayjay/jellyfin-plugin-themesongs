@@ -201,7 +201,8 @@ namespace Jellyfin.Plugin.ThemeSongs.Services
                 Directory.CreateDirectory(_cachePath);
 
                 // Generate temporary file path
-                tempFilePath = Path.Combine(_cachePath, $"{series.Name}_{series.GetProviderId(MetadataProvider.Tvdb)}.mp3");
+                var safeSeriesName = SanitizeFileName(series.Name);
+                tempFilePath = Path.Combine(_cachePath, $"{safeSeriesName}_{series.GetProviderId(MetadataProvider.Tvdb)}.mp3");
 
                 // Download the file
                 _logger.LogInformation("Downloading theme song for {SeriesName} from {Url} to {TempPath}",
@@ -275,6 +276,21 @@ namespace Jellyfin.Plugin.ThemeSongs.Services
             {
                 _logger.LogWarning(ex, "Error cleaning up temporary files");
             }
+        }
+
+        private string SanitizeFileName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+            {
+                return "unknown";
+            }
+
+            foreach (char c in Path.GetInvalidFileNameChars())
+            {
+                name = name.Replace(c, '_');
+            }
+
+            return name;
         }
 
         private IEnumerable<Series> GetSeriesFromLibrary()
