@@ -2,11 +2,11 @@
 <h3 align="center">Part of the <a href="https://jellyfin.org">Jellyfin Project</a></h3>
 
 <p align="center">
-  <a href="https://github.com/TOomaAh/jellyfin-plugin-themesongs/actions/workflows/ci.yml">
-    <img src="https://github.com/TOomaAh/jellyfin-plugin-themesongs/workflows/Build%20%26%20Test/badge.svg" alt="Build Status">
+  <a href="https://github.com/geejayjay/jellyfin-plugin-themesongs/actions/workflows/ci.yml">
+    <img src="https://github.com/geejayjay/jellyfin-plugin-themesongs/workflows/Build%20%26%20Test/badge.svg" alt="Build Status">
   </a>
-  <a href="https://github.com/TOomaAh/jellyfin-plugin-themesongs/releases">
-    <img src="https://img.shields.io/github/v/release/TOomaAh/jellyfin-plugin-themesongs" alt="Release">
+  <a href="https://github.com/geejayjay/jellyfin-plugin-themesongs/releases">
+    <img src="https://img.shields.io/github/v/release/geejayjay/jellyfin-plugin-themesongs" alt="Release">
   </a>
 </p>
 
@@ -36,7 +36,7 @@ Jellyfin Theme Songs plugin automatically downloads theme songs for your TV show
 1. In Jellyfin, go to **Dashboard → Plugins → Repositories**
 2. Click **Add** and enter:
    ```
-   https://raw.githubusercontent.com/TOomaAh/jellyfin-plugin-themesongs/master/manifest.json
+   https://raw.githubusercontent.com/geejayjay/jellyfin-plugin-themesongs/master/manifest.json
    ```
 3. Go to **Catalog** and search for "Theme Songs"
 4. Click **Install** and restart Jellyfin
@@ -84,7 +84,7 @@ Jellyfin Theme Songs plugin automatically downloads theme songs for your TV show
 ### Build from Source
 ```sh
 # Clone the repository
-git clone https://github.com/TOomaAh/jellyfin-plugin-themesongs.git
+git clone https://github.com/geejayjay/jellyfin-plugin-themesongs.git
 cd jellyfin-plugin-themesongs
 
 # Restore dependencies
