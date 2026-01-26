@@ -43,7 +43,7 @@ Jellyfin Theme Songs plugin automatically downloads theme songs for your TV show
 5. Configure the plugin in **Dashboard → Plugins → Theme Songs**
 
 ### From GitHub Releases (Manual)
-1. Download the latest `jellyfin-plugin-themesongs-vX.X.X.zip` from [Releases](https://github.com/TOomaAh/jellyfin-plugin-themesongs/releases)
+1. Download the latest `jellyfin-plugin-themesongs-vX.X.X.zip` from [Releases](https://github.com/geejayjay/jellyfin-plugin-themesongs/releases)
 2. Extract the ZIP file to your Jellyfin plugins directory:
    - **Windows**: `%ProgramData%\Jellyfin\Server\plugins\Theme Songs\`
    - **Linux**: `/var/lib/jellyfin/plugins/Theme Songs/`
