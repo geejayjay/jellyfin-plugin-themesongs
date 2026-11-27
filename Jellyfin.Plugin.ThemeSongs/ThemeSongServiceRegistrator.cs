@@ -1,50 +1,50 @@
+using System.IO;
 using Jellyfin.Plugin.ThemeSongs.Providers;
 using Jellyfin.Plugin.ThemeSongs.Services;
 using MediaBrowser.Controller;
+using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Plugins;
+using MediaBrowser.Controller.Providers;
+using MediaBrowser.Model.IO;
 using Microsoft.Extensions.DependencyInjection;
-using System.IO;
+using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.ThemeSongs
 {
-    /// <summary>
-    /// Register Theme Songs services.
-    /// </summary>
+    /// <summary>Registers the Theme Songs services.</summary>
     public class ThemeSongServiceRegistrator : IPluginServiceRegistrator
     {
         /// <inheritdoc />
         public void RegisterServices(IServiceCollection serviceCollection, IServerApplicationHost applicationHost)
         {
-            // Register core services
             serviceCollection.AddSingleton<IHttpClientService, HttpClientService>();
             serviceCollection.AddSingleton<IAudioNormalizationService, AudioNormalizationService>();
+            serviceCollection.AddSingleton<ThemeSongState>();
+            serviceCollection.AddSingleton<ThemeSongStorage>();
 
-            // Register providers
-            serviceCollection.AddSingleton<IThemeSongProvider, PlexProvider>();
+            serviceCollection.AddSingleton<VideoAudioDownloader>();
+
+            // Provider *types*; which sources are used (and their URLs) is configured on the settings page.
+            serviceCollection.AddSingleton<IThemeSongProvider, UrlTemplateProvider>();
             serviceCollection.AddSingleton<IThemeSongProvider, TelevisionTunesProvider>();
+            serviceCollection.AddSingleton<IThemeSongProvider, ThemerrDbProvider>();
 
-            // Register download service with factory to inject cache path
-            serviceCollection.AddSingleton<IThemeSongDownloadService>(serviceProvider =>
+            serviceCollection.AddSingleton<IThemeSongDownloadService>(sp =>
             {
-                var libraryManager = serviceProvider.GetRequiredService<MediaBrowser.Controller.Library.ILibraryManager>();
-                var httpClientService = serviceProvider.GetRequiredService<IHttpClientService>();
-                var audioNormalizationService = serviceProvider.GetRequiredService<IAudioNormalizationService>();
-                var providers = serviceProvider.GetServices<IThemeSongProvider>();
-                var logger = serviceProvider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<ThemeSongDownloadService>>();
-                var serverPaths = serviceProvider.GetRequiredService<IServerApplicationPaths>();
-                var cachePath = Path.Combine(serverPaths.CachePath, "ThemeSongs");
-
+                var serverPaths = sp.GetRequiredService<IServerApplicationPaths>();
                 return new ThemeSongDownloadService(
-                    libraryManager,
-                    httpClientService,
-                    audioNormalizationService,
-                    providers,
-                    logger,
-                    cachePath);
+                    sp.GetRequiredService<ILibraryManager>(),
+                    sp.GetRequiredService<IProviderManager>(),
+                    sp.GetRequiredService<IFileSystem>(),
+                    sp.GetRequiredService<IHttpClientService>(),
+                    sp.GetRequiredService<IAudioNormalizationService>(),
+                    sp.GetServices<IThemeSongProvider>(),
+                    sp.GetRequiredService<ThemeSongState>(),
+                    sp.GetRequiredService<ThemeSongStorage>(),
+                    sp.GetRequiredService<VideoAudioDownloader>(),
+                    sp.GetRequiredService<ILogger<ThemeSongDownloadService>>(),
+                    Path.Combine(serverPaths.CachePath, "ThemeSongs"));
             });
-
-            // Register legacy manager
-            serviceCollection.AddSingleton<ThemeSongsManager>();
         }
     }
 }

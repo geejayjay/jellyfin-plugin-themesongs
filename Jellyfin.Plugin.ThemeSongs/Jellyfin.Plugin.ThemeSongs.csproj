@@ -1,29 +1,23 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <IsPackable>true</IsPackable>
-    <AssemblyVersion>10.10.0.6</AssemblyVersion>
-    <FileVersion>10.10.0.6</FileVersion>
-    <Authors />
-    <Company />
+    <AssemblyVersion>12.4.0.1</AssemblyVersion>
+    <FileVersion>12.4.0.1</FileVersion>
+    <Nullable>disable</Nullable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Jellyfin.Controller" Version="10.11.0" PrivateAssets="All" />
-    <PackageReference Include="Microsoft.AspNetCore.Mvc" Version="2.2.0" PrivateAssets="All" />
+    <!-- Server assemblies are already loaded by Jellyfin: compile against them, don't ship them. -->
+    <PackageReference Include="Jellyfin.Controller" Version="12.4.0" PrivateAssets="All" ExcludeAssets="runtime" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
   <ItemGroup>
     <None Remove="Configuration\configurationpage.html" />
     <EmbeddedResource Include="Configuration\configurationpage.html" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <Folder Include="Properties\" />
-  </ItemGroup>
-
-  <ItemGroup>
   </ItemGroup>
 
 </Project>

@@ -28,7 +28,7 @@
                     <div class="sectionTitleContainer flex align-items-center">
                         <h2 class="sectionTitle">Audio Settings</h2>
                         <a is="emby-linkbutton" class="raised button-alt headerHelpButton" target="_blank"
-                            href="https://github.com/danieladov/jellyfin-plugin-themesongs">Help</a>
+                            href="https://github.com/geejayjay/jellyfin-plugin-themesongs">Help</a>
                     </div>
                     <div class="checkboxContainer">
                         <label>
@@ -37,10 +37,10 @@
                         </label>
                     </div>
                     <div class="inputContainer">
-                        <label class="inputLabel">Normalize Audio Volume (dB)</label>
+                        <label class="inputLabel">Target Loudness (LUFS)</label>
                         <input type="number" is="emby-input" id="normalizeAudioVolume" min="-30" max="0" step="1" />
                         <div class="fieldDescription">
-                            Target volume level for audio normalization
+                            Integrated loudness after normalization (EBU R128). -18 suits background theme music; lower = quieter.
                         </div>
                     </div>
                     <div class="inputContainer">
@@ -48,6 +48,13 @@
                         <input type="number" is="emby-input" id="fadeInDuration" min="0" max="10" step="1" />
                         <div class="fieldDescription">
                             Duration of the fade-in effect at the beginning
+                        </div>
+                    </div>
+                    <div class="inputContainer">
+                        <label class="inputLabel">Maximum Length (seconds)</label>
+                        <input type="number" is="emby-input" id="maxDurationSeconds" min="0" max="600" step="5" />
+                        <div class="fieldDescription">
+                            Longer themes (e.g. full songs from YouTube) are cut to this length and faded out. 0 = keep the full song.
                         </div>
                     </div>
                     <div class="inputContainer">
@@ -61,46 +68,56 @@
                         <label class="inputLabel">FFmpeg Path</label>
                         <input type="text" is="emby-input" id="ffmpegPath" />
                         <div class="fieldDescription">
-                            Leave as 'ffmpeg' to use system PATH, or specify full path like '/usr/bin/ffmpeg'
+                            Leave empty to use Jellyfin's own FFmpeg (Dashboard → Playback → Transcoding), or give a full path like '/usr/bin/ffmpeg'
                         </div>
                     </div>
+
+                    <div class="sectionTitleContainer">
+                        <h2 class="sectionTitle">Storage</h2>
+                    </div>
+                    <div class="inputContainer">
+                        <label class="inputLabel">Theme Storage Folder</label>
+                        <input type="text" is="emby-input" id="themeStoragePath" placeholder="(empty = theme.mp3 in the series folder)" />
+                        <div class="fieldDescription">
+                            Optional. A folder on the server's own disk, e.g. <code>/var/lib/jellyfin/themesongs</code>.
+                            The real files are kept there and each series folder only gets a <code>theme.mp3</code> symlink,
+                            so playing themes doesn't wake the media disks. The link only works inside Jellyfin
+                            (other machines that see the media folder see a broken link).
+                        </div>
+                    </div>
+                    <button type="button" is="emby-button" class="raised block emby-button" id="move-to-storage" onclick="moveToStorage()">
+                        <span>Move Existing Theme Songs to Storage Folder</span>
+                    </button>
+                    <div class="inputContainer">
+                        <label class="inputLabel">Retry Not Found After (days)</label>
+                        <input type="number" is="emby-input" id="retryNotFoundDays" min="1" max="365" step="1" />
+                        <div class="fieldDescription">
+                            Series no provider had a theme for are asked again only after this many days.
+                        </div>
+                    </div>
+                    <div id="themeStatus" class="fieldDescription"></div>
 
                     <div class="sectionTitleContainer">
                         <h2 class="sectionTitle">Theme Song Providers</h2>
                     </div>
                     <div class="fieldDescription">
-                        Configure which providers to use for downloading theme songs and their priority order.
+                        Sources are asked from top to bottom (lowest priority number first); if one has nothing,
+                        the next is tried. Nothing is built in: add the sources you want and fill in their URL.
                     </div>
-
-                    <div class="verticalSection">
-                        <div class="checkboxContainer">
-                            <label>
-                                <input type="checkbox" is="emby-checkbox" id="enablePlexProvider" />
-                                <span>Enable Plex Provider</span>
-                            </label>
+                    <div id="providerList"></div>
+                    <div style="display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; margin-top: 10px;">
+                        <div class="selectContainer" style="flex: 1; min-width: 220px; margin-bottom: 0;">
+                            <select is="emby-select" id="providerTypeSelect" label="Provider type"></select>
                         </div>
-                        <div class="inputContainer">
-                            <label class="inputLabel">Plex Provider Priority</label>
-                            <input type="number" is="emby-input" id="plexProviderPriority" min="1" max="10" step="1" />
-                            <div class="fieldDescription">
-                                Priority order (1 = highest priority)
-                            </div>
-                        </div>
+                        <button type="button" is="emby-button" class="raised emby-button" onclick="addProvider()">
+                            <span>Add Provider</span>
+                        </button>
                     </div>
-
-                    <div class="verticalSection">
-                        <div class="checkboxContainer">
-                            <label>
-                                <input type="checkbox" is="emby-checkbox" id="enableTelevisionTunesProvider" />
-                                <span>Enable TelevisionTunes Provider</span>
-                            </label>
-                        </div>
-                        <div class="inputContainer">
-                            <label class="inputLabel">TelevisionTunes Provider Priority</label>
-                            <input type="number" is="emby-input" id="televisionTunesProviderPriority" min="1" max="10" step="1" />
-                            <div class="fieldDescription">
-                                Priority order (1 = highest priority)
-                            </div>
+                    <div class="inputContainer" style="margin-top: 20px;">
+                        <label class="inputLabel">yt-dlp Path</label>
+                        <input type="text" is="emby-input" id="ytDlpPath" placeholder="yt-dlp" />
+                        <div class="fieldDescription">
+                            Needed only by providers that return YouTube links (ThemerrDB). Empty = <code>yt-dlp</code> from PATH.
                         </div>
                     </div>
                     <br />
@@ -115,6 +132,15 @@
                     <button type="button" is="emby-button" class="raised block emby-button" id="force-refresh-library" onclick="download(true)">
                         <span>Force Download Theme Songs</span>
                     </button>
+                    <br />
+                    <button type="button" is="emby-button" class="raised block emby-button" id="retry-missing" onclick="download(false, true)">
+                        <span>Look Up Missing Theme Songs Again</span>
+                    </button>
+                    <div class="fieldDescription">
+                        "Look up again" asks the providers now for every series without a theme (normally only every
+                        "Retry Not Found" days); existing themes are not touched.
+                        Force re-downloads every series' theme, except the ones you uploaded or deleted yourself.
+                    </div>
                 </form>
                 </div>
 
@@ -234,33 +260,18 @@
                         if (fadeOutDurationEl) {
                             fadeOutDurationEl.value = config.FadeOutDuration || 3;
                         }
+                        document.getElementById("themeStoragePath").value = config.ThemeStoragePath || "";
+                        document.getElementById("retryNotFoundDays").value = config.RetryNotFoundDays || 14;
+                        loadStatus();
                         if (ffmpegPathEl) {
-                            ffmpegPathEl.value = config.FfmpegPath || "ffmpeg";
+                            ffmpegPathEl.value = (config.FfmpegPath && config.FfmpegPath !== "ffmpeg") ? config.FfmpegPath : "";
                             console.log('Set ffmpegPath:', config.FfmpegPath);
                         }
 
-                        // Provider settings
-                        var enablePlexProviderEl = document.getElementById("enablePlexProvider");
-                        var enableTelevisionTunesProviderEl = document.getElementById("enableTelevisionTunesProvider");
-                        var plexProviderPriorityEl = document.getElementById("plexProviderPriority");
-                        var televisionTunesProviderPriorityEl = document.getElementById("televisionTunesProviderPriority");
-
-                        if (enablePlexProviderEl) {
-                            enablePlexProviderEl.checked = config.EnablePlexProvider !== false;
-                            console.log('Set enablePlexProvider:', config.EnablePlexProvider);
-                        }
-                        if (enableTelevisionTunesProviderEl) {
-                            enableTelevisionTunesProviderEl.checked = config.EnableTelevisionTunesProvider !== false;
-                            console.log('Set enableTelevisionTunesProvider:', config.EnableTelevisionTunesProvider);
-                        }
-                        if (plexProviderPriorityEl) {
-                            plexProviderPriorityEl.value = config.PlexProviderPriority || 1;
-                            console.log('Set plexProviderPriority:', config.PlexProviderPriority);
-                        }
-                        if (televisionTunesProviderPriorityEl) {
-                            televisionTunesProviderPriorityEl.value = config.TelevisionTunesProviderPriority || 2;
-                            console.log('Set televisionTunesProviderPriority:', config.TelevisionTunesProviderPriority);
-                        }
+                        document.getElementById("ytDlpPath").value = config.YtDlpPath || "";
+                        document.getElementById("maxDurationSeconds").value = (config.MaxDurationSeconds === 0 || config.MaxDurationSeconds) ? config.MaxDurationSeconds : 90;
+                        providers = (config.Providers || []).slice();
+                        loadProviderTypes().then(renderProviders);
 
                         Dashboard.hideLoadingMsg();
                         console.log('Configuration applied to form');
@@ -277,27 +288,27 @@
                     var normalizeAudioVolume = document.getElementById("normalizeAudioVolume").value;
                     var fadeInDuration = document.getElementById("fadeInDuration").value;
                     var fadeOutDuration = document.getElementById("fadeOutDuration").value;
-                    var ffmpegPath = document.getElementById("ffmpegPath").value;
+                    var ffmpegPath = document.getElementById("ffmpegPath").value.trim();
+                    var themeStoragePath = document.getElementById("themeStoragePath").value.trim();
+                    var retryNotFoundDays = parseInt(document.getElementById("retryNotFoundDays").value) || 14;
 
-                    // Get provider settings
-                    var enablePlexProvider = document.getElementById("enablePlexProvider").checked;
-                    var enableTelevisionTunesProvider = document.getElementById("enableTelevisionTunesProvider").checked;
-                    var plexProviderPriority = parseInt(document.getElementById("plexProviderPriority").value);
-                    var televisionTunesProviderPriority = parseInt(document.getElementById("televisionTunesProviderPriority").value);
+                    var ytDlpPath = document.getElementById("ytDlpPath").value.trim();
+                    var maxDurationSeconds = parseInt(document.getElementById("maxDurationSeconds").value);
+                    readProviders();
 
                     ApiClient.getPluginConfiguration(ThemeSongPluginConfiguration.uniquePluginId).then(function (config) {
                         // Update audio settings
                         config.NormalizeAudio = normalizeAudio;
-                        config.NormalizeAudioVolume = normalizeAudioVolume;
-                        config.FadeInDuration = fadeInDuration;
-                        config.FadeOutDuration = fadeOutDuration;
+                        config.NormalizeAudioVolume = parseInt(normalizeAudioVolume);
+                        config.FadeInDuration = parseInt(fadeInDuration);
+                        config.FadeOutDuration = parseInt(fadeOutDuration);
                         config.FfmpegPath = ffmpegPath;
+                        config.ThemeStoragePath = themeStoragePath;
+                        config.RetryNotFoundDays = retryNotFoundDays;
 
-                        // Update provider settings
-                        config.EnablePlexProvider = enablePlexProvider;
-                        config.EnableTelevisionTunesProvider = enableTelevisionTunesProvider;
-                        config.PlexProviderPriority = plexProviderPriority;
-                        config.TelevisionTunesProviderPriority = televisionTunesProviderPriority;
+                        config.YtDlpPath = ytDlpPath;
+                        config.MaxDurationSeconds = isNaN(maxDurationSeconds) ? 90 : Math.max(maxDurationSeconds, 0);
+                        config.Providers = providers;
 
                         ApiClient.updatePluginConfiguration(ThemeSongPluginConfiguration.uniquePluginId, config).then(function (result) {
                             Dashboard.processPluginConfigurationUpdateResult(result);
@@ -374,11 +385,8 @@
                 }
             });
 
-            function download(forceDownload) {
-                var url = ApiClient.getUrl('/ThemeSongs/DownloadTVShows');
-                if (forceDownload) {
-                    url += '?forceDownload=true';
-                }
+            function download(forceDownload, retryMissing) {
+                var url = ApiClient.getUrl('/ThemeSongs/DownloadTVShows', { forceDownload: !!forceDownload, retryMissing: !!retryMissing });
 
                 var request = {
                     url: url,
@@ -386,12 +394,106 @@
                 };
 
                 ApiClient.fetch(request).then(function () {
-                    var message = forceDownload ? "Force Downloading Theme Songs..." : "Downloading Theme Songs...";
+                    var message = forceDownload ? "Force downloading theme songs in the background..." : "Downloading theme songs in the background...";
                     Dashboard.alert(message);
+                    setTimeout(loadStatus, 3000);
+                }).catch(function (r) {
+                    Dashboard.alert(r && r.status === 409 ? "A theme song download is already running." : "Unexpected error occurred!");
+                });
+            }
+
+            var providers = [];
+            var providerTypes = [];
+
+            function esc(v) {
+                return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) {
+                    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+                });
+            }
+
+            function loadProviderTypes() {
+                return ApiClient.fetch({ url: ApiClient.getUrl('/ThemeSongs/ProviderTypes'), type: 'GET', dataType: 'json' }).then(function (types) {
+                    providerTypes = types || [];
+                    var sel = document.getElementById('providerTypeSelect');
+                    sel.innerHTML = providerTypes.map(function (t) {
+                        return '<option value="' + esc(t.type) + '">' + esc(t.name) + '</option>';
+                    }).join('');
+                });
+            }
+
+            function typeInfo(type) {
+                return providerTypes.filter(function (t) { return t.type === type; })[0] || { name: type + ' (unknown type)', urlHelp: '' };
+            }
+
+            // Copies the inputs back into the providers array.
+            function readProviders() {
+                document.querySelectorAll('#providerList .providerRow').forEach(function (row) {
+                    var p = providers[parseInt(row.getAttribute('data-i'))];
+                    p.Name = row.querySelector('.pName').value.trim();
+                    p.Url = row.querySelector('.pUrl').value.trim();
+                    p.Priority = parseInt(row.querySelector('.pPriority').value) || 1;
+                    p.Enabled = row.querySelector('.pEnabled').checked;
+                });
+            }
+
+            function renderProviders() {
+                var list = document.getElementById('providerList');
+                if (!providers.length) {
+                    list.innerHTML = '<p style="color:#888;">No providers yet - pick a type below and click Add Provider.</p>';
+                    return;
+                }
+                list.innerHTML = providers.map(function (p, i) {
+                    var t = typeInfo(p.Type);
+                    return '<div class="providerRow verticalSection" data-i="' + i + '" style="border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:10px 14px;margin-bottom:10px;">' +
+                        '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">' +
+                        '<strong>' + esc(t.name) + '</strong>' +
+                        '<label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" class="pEnabled"' + (p.Enabled !== false ? ' checked' : '') + ' /> Enabled</label>' +
+                        '<button type="button" is="emby-button" class="raised button-alt emby-button" onclick="removeProvider(' + i + ')"><span>Remove</span></button>' +
+                        '</div>' +
+                        '<div class="inputContainer"><label class="inputLabel">Name</label><input type="text" is="emby-input" class="pName" value="' + esc(p.Name) + '" /></div>' +
+                        '<div class="inputContainer"><label class="inputLabel">URL</label><input type="text" is="emby-input" class="pUrl" value="' + esc(p.Url) + '" />' +
+                        '<div class="fieldDescription">' + esc(t.urlHelp) + '</div></div>' +
+                        '<div class="inputContainer"><label class="inputLabel">Priority (1 = asked first)</label><input type="number" is="emby-input" class="pPriority" min="1" max="99" step="1" value="' + esc(p.Priority || 1) + '" /></div>' +
+                        '</div>';
+                }).join('');
+            }
+
+            function addProvider() {
+                readProviders();
+                var type = document.getElementById('providerTypeSelect').value;
+                if (!type) {
+                    return;
+                }
+                var max = providers.reduce(function (m, p) { return Math.max(m, p.Priority || 0); }, 0);
+                providers.push({ Type: type, Name: typeInfo(type).name.split(' (')[0], Url: '', Enabled: true, Priority: max + 1 });
+                renderProviders();
+            }
+
+            function removeProvider(i) {
+                readProviders();
+                providers.splice(i, 1);
+                renderProviders();
+            }
+
+            function loadStatus() {
+                ApiClient.fetch({ url: ApiClient.getUrl('/ThemeSongs/Status'), type: 'GET', dataType: 'json' }).then(function (st) {
+                    var parts = Object.keys(st.counts || {}).map(function (k) { return k + ': ' + st.counts[k]; });
+                    document.getElementById('themeStatus').textContent =
+                        (st.running ? 'Download running. ' : '') + (parts.length ? 'Series by status - ' + parts.join(', ') : '');
+                }).catch(function () { });
+            }
+
+            function moveToStorage() {
+                if (!confirm('Move every existing theme.mp3 into the storage folder and leave a symlink in the series folder? Save the storage folder first.')) {
+                    return;
+                }
+                Dashboard.showLoadingMsg();
+                ApiClient.fetch({ url: ApiClient.getUrl('/ThemeSongs/MoveToStorage'), type: 'POST', dataType: 'json' }).then(function (r) {
+                    Dashboard.hideLoadingMsg();
+                    Dashboard.alert('Moved ' + r.moved + ' theme song(s) to the storage folder.');
                 }).catch(function () {
-                    Dashboard.alert({
-                        message: "Unexpected error occurred!"
-                    });
+                    Dashboard.hideLoadingMsg();
+                    Dashboard.alert('Move failed (is a storage folder saved?).');
                 });
             }
 
@@ -416,7 +518,7 @@
                 fetch(url, {
                     method: 'GET',
                     headers: {
-                        'X-Emby-Authorization': ApiClient._authorizationHeader,
+                        'Authorization': 'MediaBrowser Token="' + ApiClient.accessToken() + '"',
                         'Content-Type': 'application/json'
                     }
                 }).then(function (response) {
@@ -436,7 +538,7 @@
 
                             var option = document.createElement('option');
                             option.value = s.Id;
-                            option.textContent = s.Name;
+                            option.textContent = s.Name + (s.HasTheme ? ' \u266A' : '') + (s.Status === 'deleted' ? ' (deleted)' : '');
                             select.appendChild(option);
                         });
                     } else {
@@ -477,7 +579,7 @@
 
                 // Get series data to display path
                 var series = seriesData[seriesId];
-                var themePath = series ? series.Path + '\\theme.mp3' : '';
+                var themePath = series ? series.Path + '/theme.mp3' : '';
 
                 ApiClient.fetch({
                     url: ApiClient.getUrl('/ThemeSongs/Series/' + seriesId + '/Theme'),
@@ -491,7 +593,8 @@
                     themeSongPathEl.textContent = themePath;
 
                     // Set new audio source with cache buster
-                    audioPlayer.src = ApiClient.getUrl('/ThemeSongs/Series/' + seriesId + '/Theme') + '?timestamp=' + new Date().getTime();
+                    // <audio> can't send the auth header: pass the token as ApiKey (Jellyfin 12 no longer accepts api_key).
+                    audioPlayer.src = ApiClient.getUrl('/ThemeSongs/Series/' + seriesId + '/Theme', { ApiKey: ApiClient.accessToken(), timestamp: new Date().getTime() });
                     audioPlayer.load();
                 }).catch(function (error) {
                     // No theme song found
@@ -531,7 +634,7 @@
                     method: 'POST',
                     body: formData,
                     headers: {
-                        'X-Emby-Authorization': ApiClient._authorizationHeader
+                        'Authorization': 'MediaBrowser Token="' + ApiClient.accessToken() + '"'
                     }
                 }).then(function (response) {
                     Dashboard.hideLoadingMsg();
@@ -569,7 +672,7 @@
                     type: 'DELETE'
                 }).then(function () {
                     Dashboard.hideLoadingMsg();
-                    Dashboard.alert('Theme song deleted successfully');
+                    Dashboard.alert('Theme song deleted. It will not be downloaded again automatically (upload one to bring it back).');
                     checkThemeSong(seriesId);
                 }).catch(function (error) {
                     Dashboard.hideLoadingMsg();

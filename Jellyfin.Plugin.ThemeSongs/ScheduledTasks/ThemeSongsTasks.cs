@@ -19,44 +19,30 @@ namespace Jellyfin.Plugin.ThemeSongs.ScheduledTasks
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         }
 
-        public async Task Execute(CancellationToken cancellationToken, IProgress<double> progress)
-        {
-            _logger.LogInformation("Starting scheduled theme songs download task");
+        public string Name => "Download TV Theme Songs";
 
-            try
-            {
-                await _downloadService.DownloadAllThemeSongsAsync(false, cancellationToken);
-                _logger.LogInformation("Scheduled theme songs download task completed successfully");
-            }
-            catch (OperationCanceledException)
-            {
-                _logger.LogInformation("Scheduled theme songs download task was cancelled");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error occurred during scheduled theme songs download task");
-                throw;
-            }
-        }
+        public string Key => "DownloadTV ThemeSongs";
 
-        public Task ExecuteAsync(IProgress<double> progress, CancellationToken cancellationToken)
+        public string Description =>
+            "Downloads theme songs for series that don't have one. Uses Jellyfin's database to see which series already have a theme (no media disk scan); series no provider had are asked again after the configured number of days.";
+
+        public string Category => "Theme Songs";
+
+        public async Task ExecuteAsync(IProgress<double> progress, CancellationToken cancellationToken)
         {
-            return Execute(cancellationToken, progress);
+            if (!await _downloadService.DownloadAllThemeSongsAsync(false, progress, cancellationToken).ConfigureAwait(false))
+            {
+                _logger.LogInformation("Skipped: a theme song download started from the plugin page is still running");
+            }
         }
 
         public IEnumerable<TaskTriggerInfo> GetDefaultTriggers()
         {
-            // Run this task every 24 hours
             yield return new TaskTriggerInfo
             {
                 Type = TaskTriggerInfoType.IntervalTrigger,
                 IntervalTicks = TimeSpan.FromHours(24).Ticks
             };
         }
-
-        public string Name => "Download TV Theme Songs";
-        public string Key => "DownloadTV ThemeSongs";
-        public string Description => "Scans all libraries to download TV Theme Songs";
-        public string Category => "Theme Songs";
     }
 }

@@ -3,46 +3,56 @@ using System.IO;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
+using MediaBrowser.Common.Net;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.ThemeSongs.Services
 {
-    public class HttpClientService : IHttpClientService, IDisposable
+    /// <summary>
+    /// HTTP access through Jellyfin's own HttpClient factory (normal certificate checks,
+    /// Jellyfin's proxy settings and user agent).
+    /// </summary>
+    public class HttpClientService : IHttpClientService
     {
-        private readonly HttpClient _httpClient;
+        /// <summary>Largest theme song accepted (a theme is usually 0.5–3 MB).</summary>
+        public const long MaxDownloadBytes = 20L * 1024 * 1024;
+
+        private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(30);
+        private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<HttpClientService> _logger;
 
-        public HttpClientService(ILogger<HttpClientService> logger)
+        public HttpClientService(IHttpClientFactory httpClientFactory, ILogger<HttpClientService> logger)
         {
-            _logger = logger;
-            var handler = new HttpClientHandler
-            {
-                ServerCertificateCustomValidationCallback = (_, _, _, _) => true
-            };
+            _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
 
-            _httpClient = new HttpClient(handler);
-            _httpClient.DefaultRequestHeaders.Add("User-Agent", "Jellyfin-ThemeSongs/1.0");
+        private HttpClient Client() => _httpClientFactory.CreateClient(NamedClient.Default);
+
+        private static CancellationTokenSource Timeout(CancellationToken ct)
+        {
+            var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(RequestTimeout);
+            return cts;
         }
 
         public async Task<string> GetStringAsync(string url, CancellationToken cancellationToken = default)
         {
             try
             {
-                _logger.LogDebug("Making GET request to {Url}", url);
-                var response = await _httpClient.GetAsync(url, cancellationToken);
-
+                using var cts = Timeout(cancellationToken);
+                using var response = await Client().GetAsync(url, cts.Token).ConfigureAwait(false);
                 if (response.IsSuccessStatusCode)
                 {
-                    return await response.Content.ReadAsStringAsync(cancellationToken);
+                    return await response.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false);
                 }
 
-                _logger.LogWarning("HTTP request failed with status {StatusCode} for URL {Url}",
-                    response.StatusCode, url);
+                _logger.LogDebug("GET {Url} returned {StatusCode}", url, response.StatusCode);
                 return null;
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
             {
-                _logger.LogError(ex, "Error making GET request to {Url}", url);
+                _logger.LogWarning("GET {Url} failed: {Message}", url, ex.Message);
                 return null;
             }
         }
@@ -51,15 +61,14 @@ namespace Jellyfin.Plugin.ThemeSongs.Services
         {
             try
             {
-                _logger.LogDebug("Making HEAD request to {Url}", url);
-                var request = new HttpRequestMessage(HttpMethod.Head, url);
-                var response = await _httpClient.SendAsync(request, cancellationToken);
-
+                using var cts = Timeout(cancellationToken);
+                using var request = new HttpRequestMessage(HttpMethod.Head, url);
+                using var response = await Client().SendAsync(request, cts.Token).ConfigureAwait(false);
                 return response.IsSuccessStatusCode;
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
             {
-                _logger.LogError(ex, "Error making HEAD request to {Url}", url);
+                _logger.LogDebug("HEAD {Url} failed: {Message}", url, ex.Message);
                 return false;
             }
         }
@@ -68,33 +77,68 @@ namespace Jellyfin.Plugin.ThemeSongs.Services
         {
             try
             {
-                _logger.LogInformation("Downloading file from {Url} to {FilePath}", url, filePath);
-
-                var response = await _httpClient.GetAsync(url, cancellationToken);
-                response.EnsureSuccessStatusCode();
-
-                var directory = Path.GetDirectoryName(filePath);
-                if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+                using var cts = Timeout(cancellationToken);
+                using var response = await Client().GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false);
+                if (!response.IsSuccessStatusCode)
                 {
-                    Directory.CreateDirectory(directory);
+                    _logger.LogWarning("Download {Url} returned {StatusCode}", url, response.StatusCode);
+                    return false;
                 }
 
-                using var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None);
-                await response.Content.CopyToAsync(fileStream, cancellationToken);
+                var type = response.Content.Headers.ContentType?.MediaType ?? string.Empty;
+                if (type.StartsWith("text/", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogWarning("Download {Url} is {ContentType}, not audio - skipped", url, type);
+                    return false;
+                }
 
-                _logger.LogInformation("Successfully downloaded file to {FilePath}", filePath);
+                if (response.Content.Headers.ContentLength > MaxDownloadBytes)
+                {
+                    _logger.LogWarning("Download {Url} is too large ({Bytes} bytes) - skipped", url, response.Content.Headers.ContentLength);
+                    return false;
+                }
+
+                Directory.CreateDirectory(Path.GetDirectoryName(filePath));
+                await using (var source = await response.Content.ReadAsStreamAsync(cts.Token).ConfigureAwait(false))
+                await using (var target = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    var buffer = new byte[81920];
+                    long total = 0;
+                    int read;
+                    while ((read = await source.ReadAsync(buffer, cts.Token).ConfigureAwait(false)) > 0)
+                    {
+                        total += read;
+                        if (total > MaxDownloadBytes)
+                        {
+                            throw new InvalidDataException($"download larger than {MaxDownloadBytes} bytes");
+                        }
+
+                        await target.WriteAsync(buffer.AsMemory(0, read), cts.Token).ConfigureAwait(false);
+                    }
+                }
+
+                if (!AudioFile.LooksLikeMp3(filePath))
+                {
+                    _logger.LogWarning("Download {Url} is not an MP3 file - skipped", url);
+                    File.Delete(filePath);
+                    return false;
+                }
+
                 return true;
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
             {
-                _logger.LogError(ex, "Error downloading file from {Url} to {FilePath}", url, filePath);
+                _logger.LogWarning("Download {Url} failed: {Message}", url, ex.Message);
+                try
+                {
+                    File.Delete(filePath);
+                }
+                catch (IOException)
+                {
+                }
+
                 return false;
             }
-        }
-
-        public void Dispose()
-        {
-            _httpClient?.Dispose();
         }
     }
 }
