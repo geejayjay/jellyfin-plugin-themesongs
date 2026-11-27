@@ -4,321 +4,348 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using MediaBrowser.Controller.Entities.TV;
-using MediaBrowser.Controller.Library;
-using MediaBrowser.Model.Entities;
-using MediaBrowser.Model.Querying;
-using Microsoft.Extensions.Logging;
 using Jellyfin.Data.Enums;
+using Jellyfin.Plugin.ThemeSongs.Configuration;
 using Jellyfin.Plugin.ThemeSongs.Providers;
 using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Entities.TV;
+using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.Providers;
+using MediaBrowser.Model.IO;
+using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.ThemeSongs.Services
 {
     public class ThemeSongDownloadService : IThemeSongDownloadService
     {
+        private readonly SemaphoreSlim _runLock = new(1, 1);
         private readonly ILibraryManager _libraryManager;
+        private readonly IProviderManager _providerManager;
+        private readonly IFileSystem _fileSystem;
         private readonly IHttpClientService _httpClientService;
         private readonly IAudioNormalizationService _audioNormalizationService;
         private readonly IEnumerable<IThemeSongProvider> _providers;
+        private readonly ThemeSongState _state;
+        private readonly ThemeSongStorage _storage;
+        private readonly VideoAudioDownloader _videoDownloader;
         private readonly ILogger<ThemeSongDownloadService> _logger;
         private readonly string _cachePath;
 
         public ThemeSongDownloadService(
             ILibraryManager libraryManager,
+            IProviderManager providerManager,
+            IFileSystem fileSystem,
             IHttpClientService httpClientService,
             IAudioNormalizationService audioNormalizationService,
             IEnumerable<IThemeSongProvider> providers,
+            ThemeSongState state,
+            ThemeSongStorage storage,
+            VideoAudioDownloader videoDownloader,
             ILogger<ThemeSongDownloadService> logger,
             string cachePath)
         {
             _libraryManager = libraryManager ?? throw new ArgumentNullException(nameof(libraryManager));
+            _providerManager = providerManager ?? throw new ArgumentNullException(nameof(providerManager));
+            _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
             _httpClientService = httpClientService ?? throw new ArgumentNullException(nameof(httpClientService));
             _audioNormalizationService = audioNormalizationService ?? throw new ArgumentNullException(nameof(audioNormalizationService));
             _providers = providers ?? throw new ArgumentNullException(nameof(providers));
+            _state = state ?? throw new ArgumentNullException(nameof(state));
+            _storage = storage ?? throw new ArgumentNullException(nameof(storage));
+            _videoDownloader = videoDownloader ?? throw new ArgumentNullException(nameof(videoDownloader));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _cachePath = cachePath ?? throw new ArgumentNullException(nameof(cachePath));
         }
 
-        public async Task DownloadAllThemeSongsAsync(bool forceDownload = false, CancellationToken cancellationToken = default)
-        {
-            _logger.LogInformation("Starting theme song download for all series (Force Download: {ForceDownload})", forceDownload);
+        public bool IsRunning => _runLock.CurrentCount == 0;
 
-            var allSeries = _libraryManager.GetItemList(new InternalItemsQuery
+        private List<Series> AllSeries() =>
+            _libraryManager.GetItemList(new InternalItemsQuery
             {
                 IncludeItemTypes = [BaseItemKind.Series],
                 IsVirtualItem = false,
-                Recursive = true,
-                HasTvdbId = true
-            }).OfType<Series>().ToList();
+                Recursive = true
+            }).OfType<Series>().Where(s => !string.IsNullOrEmpty(s.Path)).ToList();
 
-            var seriesWithThemes = allSeries.Where(s => s.GetThemeSongs().Any()).ToList();
-            var seriesWithoutThemes = allSeries.Where(s => !s.GetThemeSongs().Any()).ToList();
+        /// <summary>Theme songs Jellyfin knows from its database (no disk access).</summary>
+        private static bool HasTheme(Series s) => s.GetThemeSongs().Any();
 
-            _logger.LogInformation("Library Stats: Total Series: {Total}, With Themes: {WithThemes}, Without Themes: {WithoutThemes}",
-                allSeries.Count, seriesWithThemes.Count, seriesWithoutThemes.Count);
-
-            var seriesList = forceDownload ? allSeries : seriesWithoutThemes;
-
-            _logger.LogInformation("Processing {Count} series for theme song downloads", seriesList.Count);
-
-            int processedCount = 0;
-            int successCount = 0;
-
-            foreach (var series in seriesList)
-            {
-                if (cancellationToken.IsCancellationRequested)
-                {
-                    _logger.LogInformation("Theme song download cancelled after processing {ProcessedCount} series", processedCount);
-                    break;
-                }
-
-                try
-                {
-                    bool success = await DownloadThemeSongForSeriesAsync(series, forceDownload, cancellationToken);
-                    if (success)
-                    {
-                        successCount++;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Unexpected error downloading theme song for {SeriesName}", series.Name);
-                }
-
-                processedCount++;
-            }
-
-            _logger.LogInformation("Theme song download completed. Processed {ProcessedCount} series, {SuccessCount} successful downloads",
-                processedCount, successCount);
-        }
-
-        public async Task<bool> DownloadThemeSongForSeriesAsync(Series series, bool forceDownload = false, CancellationToken cancellationToken = default)
+        public async Task<bool> DownloadAllThemeSongsAsync(bool forceDownload = false, IProgress<double> progress = null,
+            CancellationToken cancellationToken = default, bool retryMissing = false)
         {
-            if (series == null)
+            if (!await _runLock.WaitAsync(0, cancellationToken).ConfigureAwait(false))
             {
-                throw new ArgumentNullException(nameof(series));
-            }
-
-            // Check if series already has theme songs
-            if (!forceDownload && series.GetThemeSongs().Any())
-            {
-                _logger.LogDebug("Series {SeriesName} already has theme songs, skipping", series.Name);
+                _logger.LogInformation("Theme song download is already running - not started twice");
                 return false;
             }
-
-            var tvdbId = series.GetProviderId(MetadataProvider.Tvdb);
-            if (string.IsNullOrEmpty(tvdbId))
-            {
-                _logger.LogDebug("Series {SeriesName} has no TVDb ID, skipping", series.Name);
-                return false;
-            }
-
-            _logger.LogInformation("Processing theme song download for {SeriesName}", series.Name);
 
             try
             {
-                // Try to find theme song URL from providers
-                string themeUrl = await FindThemeSongUrlAsync(series, cancellationToken);
-                if (string.IsNullOrEmpty(themeUrl))
+                var config = Plugin.Instance?.Configuration;
+                if (EnabledProviders().Count == 0)
                 {
-                    _logger.LogInformation("No theme song found for {SeriesName}", series.Name);
-                    return false;
+                    _logger.LogWarning("Theme songs: no providers configured - add one in Dashboard -> Plugins -> Theme Songs");
+                    return true;
                 }
 
-                // Download and process the theme song
-                return await DownloadAndProcessThemeSongAsync(series, themeUrl, cancellationToken);
+                int retryDays = Math.Max(config?.RetryNotFoundDays ?? 14, 1);
+                var all = AllSeries();
+                var todo = new List<Series>();
+                int skippedRecent = 0, skippedDeleted = 0, withTheme = 0;
+
+                foreach (var s in all)
+                {
+                    var entry = _state.Get(s.Id);
+                    if (entry?.Status == ThemeStatus.Uploaded || entry?.Status == ThemeStatus.Deleted)
+                    {
+                        skippedDeleted += entry.Status == ThemeStatus.Deleted ? 1 : 0;
+                        withTheme += entry.Status == ThemeStatus.Uploaded ? 1 : 0;
+                        continue;                              // the user decided: never touched automatically
+                    }
+
+                    if (HasTheme(s))
+                    {
+                        withTheme++;
+                        if (entry == null)
+                        {
+                            _state.Set(s.Id, s.Name, ThemeStatus.Existing);
+                        }
+
+                        if (!forceDownload)
+                        {
+                            continue;
+                        }
+                    }
+                    else if (!forceDownload && !retryMissing && entry != null &&
+                             (entry.Status == ThemeStatus.NotFound || entry.Status == ThemeStatus.Failed) &&
+                             entry.Checked > DateTime.UtcNow.AddDays(-retryDays))
+                    {
+                        skippedRecent++;
+                        continue;
+                    }
+
+                    todo.Add(s);
+                }
+
+                _logger.LogInformation(
+                    "Theme songs: {Total} series, {WithTheme} with a theme, {Todo} to look up, {Recent} not found in the last {Days} days, {Deleted} deleted by you (force: {Force})",
+                    all.Count, withTheme, todo.Count, skippedRecent, retryDays, skippedDeleted, forceDownload);
+
+                int done = 0, ok = 0;
+                foreach (var series in todo)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (await DownloadThemeSongForSeriesAsync(series, cancellationToken).ConfigureAwait(false))
+                    {
+                        ok++;
+                    }
+
+                    done++;
+                    progress?.Report(100.0 * done / todo.Count);
+                    if (done % 10 == 0)
+                    {
+                        _state.Save();
+                    }
+                }
+
+                _logger.LogInformation("Theme songs: {Ok} of {Count} downloaded. Totals: {Counts}", ok, todo.Count,
+                    string.Join(", ", _state.Counts().Select(kv => $"{kv.Key} {kv.Value}")));
+                return true;
+            }
+            finally
+            {
+                _state.Save();
+                progress?.Report(100);
+                _runLock.Release();
+            }
+        }
+
+        public async Task<bool> DownloadThemeSongForSeriesAsync(Series series, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(series);
+            try
+            {
+                // Ask the providers in order; if one's file can't be downloaded, try the next.
+                bool anyFound = false;
+                foreach (var (entry, provider) in EnabledProviders())
+                {
+                    ThemeSource source = null;
+                    try
+                    {
+                        source = await provider.FindAsync(entry, series, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        _logger.LogWarning("Provider {Provider} failed for {SeriesName}: {Message}", entry.Name, series.Name, ex.Message);
+                    }
+
+                    if (source == null)
+                    {
+                        continue;
+                    }
+
+                    anyFound = true;
+                    if (await DownloadAndInstallAsync(series, source, entry.Name, cancellationToken).ConfigureAwait(false))
+                    {
+                        _state.Set(series.Id, series.Name, ThemeStatus.Downloaded, entry.Name);
+                        _logger.LogInformation("Theme song for {SeriesName} installed (from {Provider})", series.Name, entry.Name);
+                        QueueRefresh(series);
+                        return true;
+                    }
+                }
+
+                _state.Set(series.Id, series.Name, anyFound ? ThemeStatus.Failed : ThemeStatus.NotFound);
+                if (!anyFound)
+                {
+                    _logger.LogDebug("No theme song found for {SeriesName}", series.Name);
+                }
+
+                return false;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error processing theme song for {SeriesName}", series.Name);
+                // Typical: the series folder is read-only for Jellyfin, ffmpeg failed, disk full.
+                _logger.LogError("Theme song for {SeriesName} failed: {Message}", series.Name, ex.Message);
+                _state.Set(series.Id, series.Name, ThemeStatus.Failed);
                 return false;
             }
         }
 
-        private async Task<string> FindThemeSongUrlAsync(Series series, CancellationToken cancellationToken)
+        /// <summary>Installs a file the user uploaded (already checked to be an MP3).</summary>
+        public async Task InstallUploadAsync(Series series, string file, CancellationToken cancellationToken)
         {
-            var enabledProviders = GetEnabledProviders();
-            var orderedProviders = enabledProviders.OrderBy(p => p.Priority);
-
-            if (!orderedProviders.Any())
-            {
-                _logger.LogWarning("No providers are enabled in configuration");
-                return null;
-            }
-
-            foreach (var provider in orderedProviders)
-            {
-                try
-                {
-                    _logger.LogDebug("Trying provider {ProviderName} (priority {Priority}) for {SeriesName}",
-                        provider.Name, provider.Priority, series.Name);
-
-                    string url = await provider.GetThemeSongUrlAsync(series, cancellationToken);
-                    if (!string.IsNullOrEmpty(url))
-                    {
-                        _logger.LogInformation("Found theme song URL for {SeriesName} using provider {ProviderName}",
-                            series.Name, provider.Name);
-                        return url;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Provider {ProviderName} failed for {SeriesName}",
-                        provider.Name, series.Name);
-                }
-            }
-
-            return null;
+            await _storage.InstallAsync(series, file, cancellationToken).ConfigureAwait(false);
+            _state.Set(series.Id, series.Name, ThemeStatus.Uploaded, "upload");
+            _state.Save();
+            QueueRefresh(series);
         }
 
-        private IEnumerable<IThemeSongProvider> GetEnabledProviders()
+        public void Delete(Series series)
         {
-            var config = Plugin.Instance?.Configuration;
-            if (config == null)
+            _storage.Delete(series);
+            _state.Set(series.Id, series.Name, ThemeStatus.Deleted);
+            _state.Save();
+            QueueRefresh(series);
+        }
+
+        /// <summary>Moves every real theme.mp3 that Jellyfin knows about into the storage folder (symlink left behind).</summary>
+        public async Task<int> MoveExistingToStorageAsync(CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrEmpty(ThemeSongStorage.StoragePath))
             {
-                _logger.LogWarning("Plugin configuration is not available, using all providers");
-                return _providers;
+                throw new InvalidOperationException("no theme storage folder configured");
             }
 
-            var enabledProviders = new List<IThemeSongProvider>();
-
-            foreach (var provider in _providers)
+            if (!await _runLock.WaitAsync(0, cancellationToken).ConfigureAwait(false))
             {
-                bool isEnabled = provider.Name switch
-                {
-                    "Plex" => config.EnablePlexProvider,
-                    "TelevisionTunes" => config.EnableTelevisionTunesProvider,
-                    _ => true // Enable unknown providers by default
-                };
+                throw new InvalidOperationException("a theme song download is running, try again later");
+            }
 
-                if (isEnabled)
+            try
+            {
+                int moved = 0;
+                foreach (var series in AllSeries().Where(HasTheme))
                 {
-                    enabledProviders.Add(provider);
-                    _logger.LogDebug("Provider {ProviderName} is enabled (priority {Priority})",
-                        provider.Name, provider.Priority);
+                    try
+                    {
+                        if (await _storage.MoveToStorageAsync(series, cancellationToken).ConfigureAwait(false))
+                        {
+                            moved++;
+                            QueueRefresh(series);
+                        }
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        _logger.LogError("Moving the theme of {SeriesName} failed: {Message}", series.Name, ex.Message);
+                    }
+                }
+
+                _logger.LogInformation("Moved {Count} theme songs to {Path}", moved, ThemeSongStorage.StoragePath);
+                return moved;
+            }
+            finally
+            {
+                _runLock.Release();
+            }
+        }
+
+        private void QueueRefresh(Series series)
+        {
+            // Refresh only the local files (extras): no online metadata lookups, no image downloads.
+            var options = new MetadataRefreshOptions(new DirectoryService(_fileSystem))
+            {
+                MetadataRefreshMode = MetadataRefreshMode.ValidationOnly,
+                ImageRefreshMode = MetadataRefreshMode.ValidationOnly
+            };
+            _providerManager.QueueRefresh(series.Id, options, RefreshPriority.Normal);
+        }
+
+        /// <summary>Configured provider entries (enabled, in priority order) with their type implementation.</summary>
+        private List<(ProviderEntry Entry, IThemeSongProvider Provider)> EnabledProviders()
+        {
+            var types = _providers.ToDictionary(p => p.Type, StringComparer.OrdinalIgnoreCase);
+            var result = new List<(ProviderEntry, IThemeSongProvider)>();
+            foreach (var e in (Plugin.Instance?.Configuration?.Providers ?? new List<ProviderEntry>())
+                         .Where(e => e.Enabled && !string.IsNullOrWhiteSpace(e.Url)).OrderBy(e => e.Priority))
+            {
+                if (types.TryGetValue(e.Type ?? string.Empty, out var p))
+                {
+                    result.Add((e, p));
                 }
                 else
                 {
-                    _logger.LogDebug("Provider {ProviderName} is disabled in configuration", provider.Name);
+                    _logger.LogWarning("Theme song provider {Name} has unknown type {Type} - skipped", e.Name, e.Type);
                 }
             }
 
-            return enabledProviders;
+            return result;
         }
 
-        private async Task<bool> DownloadAndProcessThemeSongAsync(Series series, string themeUrl, CancellationToken cancellationToken)
+        private async Task<bool> DownloadAndInstallAsync(Series series, ThemeSource source, string providerName, CancellationToken cancellationToken)
         {
-            string tempFilePath = null;
-            string finalFilePath = Path.Combine(series.Path, "theme.mp3");
-
+            string work = Path.Combine(_cachePath, series.Id.ToString("N"));
+            Directory.CreateDirectory(work);
             try
             {
-                // Ensure cache directory exists
-                Directory.CreateDirectory(_cachePath);
-
-                // Generate temporary file path
-                var safeSeriesName = SanitizeFileName(series.Name);
-                tempFilePath = Path.Combine(_cachePath, $"{safeSeriesName}_{series.GetProviderId(MetadataProvider.Tvdb)}.mp3");
-
-                // Download the file
-                _logger.LogInformation("Downloading theme song for {SeriesName} from {Url} to {TempPath}",
-                    series.Name, themeUrl, tempFilePath);
-
-                bool downloadSuccess = await _httpClientService.DownloadFileAsync(themeUrl, tempFilePath, cancellationToken);
-                if (!downloadSuccess)
+                string downloaded;
+                if (source.Kind == ThemeSourceKind.Video)
                 {
-                    _logger.LogError("Failed to download theme song for {SeriesName}", series.Name);
-                    return false;
+                    downloaded = await _videoDownloader.DownloadAsync(source.Url, work,
+                        (_audioNormalizationService as AudioNormalizationService)?.FfmpegDirectory, cancellationToken).ConfigureAwait(false);
                 }
-
-                // Process audio normalization if enabled
-                string processedFilePath = tempFilePath;
-                if (Plugin.Instance?.Configuration?.NormalizeAudio == true)
+                else
                 {
-                    _logger.LogDebug("Normalizing audio for {SeriesName}", series.Name);
-                    processedFilePath = await _audioNormalizationService.NormalizeAudioAsync(tempFilePath);
-
-                    if (string.IsNullOrEmpty(processedFilePath))
+                    downloaded = Path.Combine(work, "download.mp3");
+                    if (!await _httpClientService.DownloadFileAsync(source.Url, downloaded, cancellationToken).ConfigureAwait(false))
                     {
-                        _logger.LogError("Audio normalization failed for {SeriesName}", series.Name);
-                        return false;
+                        downloaded = null;
                     }
                 }
 
-                // Ensure the series directory exists before moving the file
-                var seriesDir = Path.GetDirectoryName(finalFilePath);
-                if (!string.IsNullOrEmpty(seriesDir))
+                if (downloaded == null)
                 {
-                    Directory.CreateDirectory(seriesDir);
+                    _logger.LogWarning("{Provider} had a theme for {SeriesName} but the download failed ({Url})", providerName, series.Name, source.Url);
+                    return false;
                 }
 
-                // Move the final file to the series directory
-                File.Move(processedFilePath, finalFilePath, true);
-
-                // Clean up temporary files
-                CleanupTempFiles(tempFilePath, processedFilePath);
-
-                _logger.LogInformation("Successfully downloaded and processed theme song for {SeriesName} in path {path}", series.Name, seriesDir);
+                string processed = await _audioNormalizationService.ProcessAsync(downloaded, work, cancellationToken).ConfigureAwait(false);
+                await _storage.InstallAsync(series, processed, cancellationToken).ConfigureAwait(false);
                 return true;
             }
-            catch (Exception ex)
+            finally
             {
-                _logger.LogError(ex, "Error downloading and processing theme song for {SeriesName}", series.Name);
-
-                // Clean up any temporary files on error
-                CleanupTempFiles(tempFilePath, null);
-
-                return false;
-            }
-        }
-
-        private void CleanupTempFiles(string tempFilePath, string processedFilePath)
-        {
-            try
-            {
-                if (!string.IsNullOrEmpty(tempFilePath) && File.Exists(tempFilePath))
+                try
                 {
-                    File.Delete(tempFilePath);
+                    Directory.Delete(work, true);
                 }
-
-                if (!string.IsNullOrEmpty(processedFilePath) &&
-                    processedFilePath != tempFilePath &&
-                    File.Exists(processedFilePath))
+                catch (IOException)
                 {
-                    File.Delete(processedFilePath);
                 }
             }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Error cleaning up temporary files");
-            }
-        }
-
-        private string SanitizeFileName(string name)
-        {
-            if (string.IsNullOrEmpty(name))
-            {
-                return "unknown";
-            }
-
-            foreach (char c in Path.GetInvalidFileNameChars())
-            {
-                name = name.Replace(c, '_');
-            }
-
-            return name;
-        }
-
-        private IEnumerable<Series> GetSeriesFromLibrary()
-        {
-            return _libraryManager.GetItemList(new InternalItemsQuery
-            {
-                IncludeItemTypes = [BaseItemKind.Series],
-                IsVirtualItem = false,
-                Recursive = true,
-                HasTvdbId = true
-            }).OfType<Series>();
         }
     }
 }

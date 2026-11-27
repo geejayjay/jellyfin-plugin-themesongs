@@ -1,391 +1,206 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
+using MediaBrowser.Controller.MediaEncoding;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.ThemeSongs.Services
 {
+    /// <summary>
+    /// Trims silence, normalizes loudness (two-pass EBU R128 loudnorm to the configured LUFS
+    /// target) and adds fades. Uses Jellyfin's own ffmpeg unless another path is configured.
+    /// </summary>
     public class AudioNormalizationService : IAudioNormalizationService
     {
+        private static readonly TimeSpan StepTimeout = TimeSpan.FromMinutes(3);
         private readonly ILogger<AudioNormalizationService> _logger;
-        private bool? _ffmpegAvailable;
-        private string _lastCheckedPath;
+        private readonly IMediaEncoder _mediaEncoder;
 
-        public AudioNormalizationService(ILogger<AudioNormalizationService> logger)
+        public AudioNormalizationService(ILogger<AudioNormalizationService> logger, IMediaEncoder mediaEncoder)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _mediaEncoder = mediaEncoder;
         }
 
-        private string GetFfmpegPath()
-        {
-            var config = Plugin.Instance?.Configuration;
-            return !string.IsNullOrWhiteSpace(config?.FfmpegPath) ? config.FfmpegPath : "ffmpeg";
-        }
+        /// <summary>Folder of the ffmpeg in use (for yt-dlp --ffmpeg-location).</summary>
+        public string FfmpegDirectory => Path.GetDirectoryName(FfmpegPath());
 
-        private async Task<bool> IsFfmpegAvailableAsync()
+        private string FfmpegPath()
         {
-            string currentPath = GetFfmpegPath();
-
-            // Re-check if the path has changed
-            if (_ffmpegAvailable.HasValue && _lastCheckedPath == currentPath)
+            var configured = Plugin.Instance?.Configuration?.FfmpegPath;
+            if (!string.IsNullOrWhiteSpace(configured) && configured != "ffmpeg")
             {
-                return _ffmpegAvailable.Value;
+                return configured;
             }
 
-            _lastCheckedPath = currentPath;
+            var own = _mediaEncoder?.EncoderPath;
+            return string.IsNullOrWhiteSpace(own) ? "ffmpeg" : own;
+        }
 
+        private string FfprobePath()
+        {
+            var ffmpeg = FfmpegPath();
+            if (ffmpeg == _mediaEncoder?.EncoderPath && !string.IsNullOrWhiteSpace(_mediaEncoder?.ProbePath))
+            {
+                return _mediaEncoder.ProbePath;
+            }
+
+            var dir = Path.GetDirectoryName(ffmpeg);
+            return string.IsNullOrEmpty(dir) ? "ffprobe" : Path.Combine(dir, "ffprobe");
+        }
+
+        public async Task<string> ProcessAsync(string inputFilePath, string workDir, CancellationToken cancellationToken)
+        {
+            var config = Plugin.Instance?.Configuration;
+            Directory.CreateDirectory(workDir);
+            int maxLength = Math.Max(config?.MaxDurationSeconds ?? 0, 0);
+            if (config?.NormalizeAudio != true)
+            {
+                double inLength = await GetDurationAsync(inputFilePath, cancellationToken).ConfigureAwait(false);
+                bool tooLong = maxLength > 0 && inLength > maxLength;
+                if (AudioFile.LooksLikeMp3(inputFilePath) && !tooLong)
+                {
+                    return inputFilePath;
+                }
+
+                // Not MP3 (e.g. a YouTube download) and/or too long: convert, cut, fade out the cut.
+                string mp3 = Path.Combine(workDir, Path.GetFileNameWithoutExtension(inputFilePath) + ".converted.mp3");
+                var args = new List<string> { "-nostdin", "-hide_banner", "-y", "-i", inputFilePath, "-vn" };
+                if (tooLong)
+                {
+                    double fade = Math.Min(Math.Max(config?.FadeOutDuration ?? 3, 1), maxLength * 0.25);
+                    args.AddRange(new[]
+                    {
+                        "-t", maxLength.ToString(CultureInfo.InvariantCulture),
+                        "-af", string.Create(CultureInfo.InvariantCulture, $"afade=t=out:st={maxLength - fade:F2}:d={fade:F2}:curve=hsin")
+                    });
+                }
+
+                args.AddRange(new[] { "-ar", "44100", "-c:a", "libmp3lame", "-q:a", "2", mp3 });
+                await ProcessRunner.RunAsync(FfmpegPath(), cancellationToken, args.ToArray()).ConfigureAwait(false);
+                return mp3;
+            }
+
+            string stem = Path.Combine(workDir, Path.GetFileNameWithoutExtension(inputFilePath));
+            string trimmed = stem + ".trim.wav";
+            string output = stem + ".normalized.mp3";
             try
             {
-                var processInfo = new ProcessStartInfo
+                // 1. Trim leading/trailing silence first, so the fade-out lands on the real end.
+                await ProcessRunner.RunAsync(FfmpegPath(), cancellationToken,
+                    "-nostdin", "-hide_banner", "-y", "-i", inputFilePath, "-vn",
+                    "-af", "silenceremove=start_periods=1:start_silence=0.1:start_threshold=-50dB," +
+                           "areverse,silenceremove=start_periods=1:start_silence=0.1:start_threshold=-50dB,areverse",
+                    "-c:a", "pcm_s16le", trimmed).ConfigureAwait(false);
+
+                double duration = await GetDurationAsync(trimmed, cancellationToken).ConfigureAwait(false);
+                if (duration <= 1)
                 {
-                    FileName = currentPath,
-                    Arguments = "-version",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
+                    throw new InvalidDataException($"audio is only {duration:F1} s long after trimming silence");
+                }
+
+                // Cut long themes (full songs) to the configured maximum.
+                double length = maxLength > 0 ? Math.Min(duration, maxLength) : duration;
+                string lengthArg = length.ToString("F2", CultureInfo.InvariantCulture);
+
+                // 2. Measure loudness (of the part that is kept).
+                string target = config.NormalizeAudioVolume.ToString(CultureInfo.InvariantCulture);
+                string loudnorm = $"loudnorm=I={target}:TP=-1.5:LRA=11";
+                var measure = await ProcessRunner.RunAsync(FfmpegPath(), cancellationToken,
+                    "-nostdin", "-hide_banner", "-t", lengthArg, "-i", trimmed, "-af", loudnorm + ":print_format=json", "-f", "null", "-")
+                    .ConfigureAwait(false);
+                var m = ParseLoudnorm(measure.StdErr);
+
+                // 3. Apply measured loudnorm + fades (never longer than a quarter of the song each).
+                double maxFade = length * 0.25;
+                double fadeIn = Math.Min(Math.Max(config.FadeInDuration, 0), maxFade);
+                double fadeOut = Math.Min(Math.Max(config.FadeOutDuration, 0), maxFade);
+                var filters = new List<string>
+                {
+                    m == null
+                        ? loudnorm
+                        : string.Create(CultureInfo.InvariantCulture,
+                            $"{loudnorm}:measured_I={m["input_i"]}:measured_TP={m["input_tp"]}:measured_LRA={m["input_lra"]}:measured_thresh={m["input_thresh"]}:offset={m["target_offset"]}:linear=true")
                 };
-
-                using var process = new Process { StartInfo = processInfo };
-                process.Start();
-                await process.WaitForExitAsync();
-
-                _ffmpegAvailable = process.ExitCode == 0;
-                if (!_ffmpegAvailable.Value)
+                if (fadeIn > 0)
                 {
-                    _logger.LogWarning("FFmpeg at path '{FfmpegPath}' is not available. Audio normalization will be disabled.", currentPath);
+                    filters.Add(string.Create(CultureInfo.InvariantCulture, $"afade=t=in:st=0:d={fadeIn:F2}:curve=hsin"));
                 }
-                else
+
+                if (fadeOut > 0)
                 {
-                    _logger.LogInformation("FFmpeg found at '{FfmpegPath}'", currentPath);
+                    filters.Add(string.Create(CultureInfo.InvariantCulture, $"afade=t=out:st={length - fadeOut:F2}:d={fadeOut:F2}:curve=hsin"));
                 }
-                return _ffmpegAvailable.Value;
+
+                await ProcessRunner.RunAsync(FfmpegPath(), cancellationToken,
+                    "-nostdin", "-hide_banner", "-y", "-t", lengthArg, "-i", trimmed, "-af", string.Join(",", filters),
+                    "-ar", "44100", "-c:a", "libmp3lame", "-q:a", "2", output).ConfigureAwait(false);
+
+                _logger.LogDebug("Normalized {Input} ({Duration:F1} of {Full:F1} s, measured {Loudness} LUFS)", inputFilePath, length, duration,
+                    m?["input_i"] ?? "?");
+                return output;
             }
-            catch (Exception ex)
+            finally
             {
-                _logger.LogWarning(ex, "FFmpeg at path '{FfmpegPath}' is not available. Audio normalization will be disabled.", currentPath);
-                _ffmpegAvailable = false;
-                return false;
+                TryDelete(trimmed);
             }
         }
 
-        public async Task<string> NormalizeAudioAsync(string inputFilePath)
+        private static Dictionary<string, string> ParseLoudnorm(string stderr)
         {
-            if (string.IsNullOrEmpty(inputFilePath))
+            int start = stderr.LastIndexOf('{');
+            int end = stderr.LastIndexOf('}');
+            if (start < 0 || end <= start)
             {
-                throw new ArgumentException("Input file path cannot be null or empty", nameof(inputFilePath));
+                return null;
             }
-
-            ValidateInputFile(inputFilePath);
 
             try
             {
-                var config = Plugin.Instance?.Configuration;
-                if (config?.NormalizeAudio != true)
+                var values = JsonSerializer.Deserialize<Dictionary<string, string>>(stderr.Substring(start, end - start + 1));
+                foreach (var key in new[] { "input_i", "input_tp", "input_lra", "input_thresh", "target_offset" })
                 {
-                    _logger.LogDebug("Audio normalization is disabled in configuration");
-                    return inputFilePath;
-                }
-
-                // Check if FFmpeg is available
-                if (!await IsFfmpegAvailableAsync())
-                {
-                    _logger.LogWarning("Audio normalization is enabled but FFmpeg is not available. Skipping normalization for {FilePath}", inputFilePath);
-                    return inputFilePath;
-                }
-
-                string targetVolume = $"{config.NormalizeAudioVolume}dB";
-                string currentVolume = await DetectVolumeAsync(inputFilePath);
-
-                if (IsVolumeAlreadyNormalized(targetVolume, currentVolume))
-                {
-                    _logger.LogInformation("Audio volume is already normalized for {FilePath}: {CurrentVolume}",
-                        inputFilePath, currentVolume);
-                    return inputFilePath;
-                }
-
-                return await NormalizeAudioFileAsync(inputFilePath);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to normalize audio for {FilePath}", inputFilePath);
-                throw;
-            }
-        }
-
-        public async Task<bool> IsNormalizationRequiredAsync(string filePath)
-        {
-            try
-            {
-                var config = Plugin.Instance?.Configuration;
-                if (config?.NormalizeAudio != true)
-                {
-                    return false;
-                }
-
-                // Check if FFmpeg is available
-                if (!await IsFfmpegAvailableAsync())
-                {
-                    return false;
-                }
-
-                string targetVolume = $"{config.NormalizeAudioVolume}dB";
-                string currentVolume = await DetectVolumeAsync(filePath);
-
-                return !IsVolumeAlreadyNormalized(targetVolume, currentVolume);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Could not determine if normalization is required for {FilePath}", filePath);
-                return false;
-            }
-        }
-
-        private async Task<string> DetectVolumeAsync(string filePath)
-        {
-            var processInfo = new ProcessStartInfo
-            {
-                FileName = GetFfmpegPath(),
-                Arguments = $"-i \"{filePath}\" -af \"volumedetect\" -f null -",
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            };
-
-            using var process = new Process { StartInfo = processInfo };
-
-            _logger.LogDebug("Running volume detection for {FilePath}", filePath);
-            process.Start();
-
-            string output = await process.StandardOutput.ReadToEndAsync();
-            string error = await process.StandardError.ReadToEndAsync();
-
-            await process.WaitForExitAsync();
-
-            if (process.ExitCode != 0)
-            {
-                throw new InvalidOperationException($"FFmpeg volume detection failed: {error}");
-            }
-
-            return ExtractVolumeFromOutput(error);
-        }
-
-        private async Task<string> NormalizeAudioFileAsync(string inputFilePath)
-        {
-            string outputPath = GenerateOutputPath(inputFilePath);
-
-            if (File.Exists(outputPath))
-            {
-                File.Delete(outputPath);
-            }
-
-            var config = Plugin.Instance?.Configuration;
-            int fadeIn = config?.FadeInDuration ?? 3;
-            int fadeOut = config?.FadeOutDuration ?? 3;
-
-            double duration = await GetAudioDurationAsync(inputFilePath);
-            
-            // Safety check: ensure fades don't exceed 25% of duration each
-            if (duration > 0)
-            {
-                double maxFade = duration * 0.25;
-                fadeIn = (int)Math.Min(fadeIn, maxFade);
-                fadeOut = (int)Math.Min(fadeOut, maxFade);
-            }
-            else
-            {
-                // If duration detection failed, use minimal fades as safety
-                fadeIn = Math.Min(fadeIn, 1);
-                fadeOut = Math.Min(fadeOut, 1);
-            }
-
-            double fadeOutStart = Math.Max(0, duration - fadeOut);
-
-            // Filter chain: 
-            // 1. Remove silence from start/end
-            // 2. Normalize volume (loudnorm)
-            // 3. Apply half-sine (hsin) fades for smoother transitions
-            string filters = $"silenceremove=start_periods=1:start_silence=0.1:start_threshold=-50dB:stop_periods=1:stop_silence=0.1:stop_threshold=-50dB, " +
-                             $"volume=-1dB, loudnorm, " +
-                             $"afade=t=in:st=0:d={fadeIn}:curve=hsin, " +
-                             $"afade=t=out:st={fadeOutStart:F2}:d={fadeOut}:curve=hsin";
-            
-            string arguments = $"-i \"{inputFilePath}\" -af \"{filters}\" -y \"{outputPath}\"";
-
-            var processInfo = new ProcessStartInfo
-            {
-                FileName = GetFfmpegPath(),
-                Arguments = arguments,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            };
-
-            using var process = new Process { StartInfo = processInfo };
-
-            _logger.LogInformation("Normalizing audio file {InputPath} to {OutputPath}", inputFilePath, outputPath);
-            process.Start();
-
-            string output = await process.StandardOutput.ReadToEndAsync();
-            string error = await process.StandardError.ReadToEndAsync();
-
-            await process.WaitForExitAsync();
-
-            if (process.ExitCode != 0)
-            {
-                _logger.LogError("FFmpeg normalization failed with error: {Error}", error);
-                throw new InvalidOperationException($"FFmpeg normalization failed: {error}");
-            }
-
-            _logger.LogDebug("Audio normalization completed successfully for {FilePath}", inputFilePath);
-            return outputPath;
-        }
-
-        private static string ExtractVolumeFromOutput(string ffmpegOutput)
-        {
-            string[] lines = ffmpegOutput.Split(new[] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries);
-
-            foreach (string line in lines)
-            {
-                if (line.Contains("max_volume"))
-                {
-                    int colonIndex = line.LastIndexOf(':');
-                    if (colonIndex > 0 && colonIndex < line.Length - 1)
+                    if (!values.TryGetValue(key, out var v) ||
+                        !double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) ||
+                        double.IsInfinity(d))
                     {
-                        return line.Substring(colonIndex + 1).Trim();
-                    }
-
-                    string[] parts = line.Split(new[] { " " }, StringSplitOptions.RemoveEmptyEntries);
-                    if (parts.Length >= 2)
-                    {
-                        return $"{parts[^2]} {parts[^1]}";
+                        return null;   // silence/invalid measurement: fall back to one-pass loudnorm
                     }
                 }
-            }
 
-            throw new InvalidOperationException("Could not extract volume information from FFmpeg output");
+                return values;
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
         }
 
-        private async Task<double> GetAudioDurationAsync(string filePath)
+        private async Task<double> GetDurationAsync(string path, CancellationToken ct)
         {
-            string ffmpegPath = GetFfmpegPath();
-            string ffprobePath;
-            
-            // If ffmpeg is just a command name (not a path), assume ffprobe is also in PATH
-            if (!ffmpegPath.Contains(Path.DirectorySeparatorChar) && !ffmpegPath.Contains(Path.AltDirectorySeparatorChar))
-            {
-                ffprobePath = "ffprobe";
-            }
-            else
-            {
-                // Extract directory from ffmpeg path and construct ffprobe path
-                string directory = Path.GetDirectoryName(ffmpegPath);
-                ffprobePath = Path.Combine(directory, "ffprobe");
-            }
-            
-            string arguments = $"-v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"{filePath}\"";
-
-            var processInfo = new ProcessStartInfo
-            {
-                FileName = ffprobePath,
-                Arguments = arguments,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            };
-
-            using var process = new Process { StartInfo = processInfo };
-            process.Start();
-
-            string output = (await process.StandardOutput.ReadToEndAsync()).Trim();
-            await process.WaitForExitAsync();
-
-            if (double.TryParse(output, NumberStyles.Float, CultureInfo.InvariantCulture, out double duration))
-            {
-                return duration;
-            }
-
-            _logger.LogWarning("Failed to retrieve audio duration for {FilePath}. Output: {Output}", filePath, output);
-            return 0; // Return 0 as fallback
+            var r = await ProcessRunner.RunAsync(FfprobePath(), ct,
+                "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path)
+                .ConfigureAwait(false);
+            return double.TryParse(r.StdOut.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var d) ? d : 0;
         }
 
-        private bool IsVolumeAlreadyNormalized(string targetVolume, string currentVolume)
+        private static void TryDelete(string path)
         {
             try
             {
-                double target = ParseVolumeValue(targetVolume);
-                double current = ParseVolumeValue(currentVolume);
-                const double epsilon = 0.5;
-
-                return Math.Abs(target - current) < epsilon;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Could not compare volumes: target={TargetVolume}, current={CurrentVolume}",
-                    targetVolume, currentVolume);
-                return false;
-            }
-        }
-
-        private static double ParseVolumeValue(string volumeString)
-        {
-            if (string.IsNullOrEmpty(volumeString))
-            {
-                throw new ArgumentException("Volume string is null or empty");
-            }
-
-            var match = Regex.Match(volumeString, @"volume:\s*([-\d.]+)\s*dB");
-            if (match.Success)
-            {
-                volumeString = match.Groups[1].Value;
-            }
-            else if (volumeString.EndsWith("dB", StringComparison.OrdinalIgnoreCase))
-            {
-                int colonIndex = volumeString.LastIndexOf(':');
-                if (colonIndex > 0)
+                if (File.Exists(path))
                 {
-                    volumeString = volumeString.Substring(colonIndex + 1);
+                    File.Delete(path);
                 }
-                volumeString = volumeString.Replace("dB", "").Trim();
             }
-
-            if (!double.TryParse(volumeString, NumberStyles.Float, CultureInfo.InvariantCulture, out double result))
+            catch (IOException)
             {
-                throw new FormatException($"Invalid volume format: {volumeString}");
-            }
-
-            return result;
-        }
-
-        private static string GenerateOutputPath(string inputFilePath)
-        {
-            string directory = Path.GetDirectoryName(inputFilePath);
-            string fileName = Path.GetFileNameWithoutExtension(inputFilePath);
-            string extension = Path.GetExtension(inputFilePath);
-
-            return Path.Combine(directory, $"normalized_{fileName}{extension}");
-        }
-
-        private static void ValidateInputFile(string filePath)
-        {
-            if (!File.Exists(filePath))
-            {
-                throw new FileNotFoundException($"File not found: {filePath}");
-            }
-
-            try
-            {
-                using var fileStream = File.OpenRead(filePath);
-            }
-            catch (Exception ex)
-            {
-                throw new UnauthorizedAccessException($"File is not accessible: {filePath}", ex);
             }
         }
     }

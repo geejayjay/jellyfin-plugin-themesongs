@@ -16,19 +16,24 @@ Jellyfin Theme Songs plugin automatically downloads theme songs for your TV show
 
 ## ✨ Features
 
-- 🎵 **Automatic Theme Song Downloads**: Seamlessly downloads theme songs for your TV shows
-- 🔧 **Configurable Providers**: Choose between Plex and TelevisionTunes providers with custom priorities
-- 🎚️ **Audio Normalization**: Optional FFmpeg-based audio normalization with configurable volume levels
-- 📅 **Scheduled Tasks**: Automatic background downloads with customizable scheduling
-- 🛠️ **RESTful API**: Programmatic control via HTTP endpoints
-- 🏗️ **Modern Architecture**: Built with .NET 8, dependency injection, and async/await patterns
+- 🎵 **Automatic theme song downloads** for TV series from **sources you configure** (nothing built in):
+  pick a provider type in the *Add Provider* dropdown, fill in its URL and priority.
+- 💾 **Optional storage folder + symlinks**: keep the real files on the server's own (SSD) disk and only put a
+  `theme.mp3` symlink in each series folder, so theme playback never wakes the media disks.
+  One button moves existing `theme.mp3` files there.
+- 🧠 **No media disk scan**: which series already have a theme comes from Jellyfin's database; a small state file
+  in the plugin's data folder remembers downloads, misses (asked again only after N days, default 14) and themes
+  you deleted (never downloaded again automatically).
+- 🎚️ **Loudness normalization** (two-pass EBU R128 to your LUFS target), silence trimming and fades,
+  using Jellyfin's own FFmpeg.
+- 🔒 **Admin-only API**, normal TLS certificate checks, downloads/uploads must really be MP3 (max 20 MB).
+- 📅 **Scheduled task** with progress; never runs twice at the same time.
 
 ## 📋 Requirements
 
-- Jellyfin 10.10.0 or higher
-- .NET 8.0 runtime
-- FFmpeg (optional, for audio normalization)
-- TVDb provider enabled in Jellyfin
+- Jellyfin 12.4 or newer (.NET 10)
+- TVDB ids on your series (for the Plex provider)
+- Jellyfin needs write access to the series folders (also with a storage folder: the symlink goes there)
 
 ## 🚀 Installation
 
@@ -53,19 +58,33 @@ Jellyfin Theme Songs plugin automatically downloads theme songs for your TV show
 
 ## ⚙️ Configuration
 
-### Provider Settings
-- **Enable/Disable Providers**: Toggle Plex and TelevisionTunes providers
-- **Provider Priorities**: Set search order (1 = highest priority)
-- **Default Configuration**: Plex (Priority 1), TelevisionTunes (Priority 2)
+### Providers
+Nothing is hard-coded: add sources under **Theme Song Providers → Add Provider**. Each entry has a type, a name,
+a URL, a priority (1 = asked first) and an on/off switch. If a source has nothing (or its download fails), the
+next one is tried.
+
+| Type | URL to enter | Example |
+| --- | --- | --- |
+| Direct MP3 URL (template) | URL with `{tvdb}` `{tmdb}` `{imdb}` `{anidb}` `{name}` | Plex archive: `https://tvthemes.plexapp.com/{tvdb}.mp3` |
+| TelevisionTunes | site base URL (A–Z pages at `/browse/<letter>`) | `https://televisiontunes.com` |
+| ThemerrDB | database base URL (`/tv_shows/themoviedb/<id>.json`), YouTube links, **needs yt-dlp** | `https://raw.githubusercontent.com/LizardByte/ThemerrDB/gh-pages` |
+
+**Look Up Missing Theme Songs Again** asks the providers right away for every series without a theme
+(normally a miss is retried only after *Retry Not Found* days).
 
 ### Audio Settings
 - **Normalize Audio**: Enable/disable audio normalization
-- **Target Volume**: Configure normalization level (-30dB to 0dB, default: -15dB)
+- **Target Loudness**: integrated loudness in LUFS (default -18)
+- **FFmpeg Path**: empty = Jellyfin's own FFmpeg
+
+### Storage
+- **Theme Storage Folder**: empty = `theme.mp3` in the series folder. Set (e.g. `/var/lib/jellyfin/themesongs`) = real file there, symlink in the series folder. Other machines that see the media folder (SMB, Sonarr) only see a broken link.
+- **Retry Not Found After (days)**: default 14
 
 ### Usage Options
 1. **Manual Download**: Use the "Download Theme Songs" button in plugin configuration
 2. **Scheduled Task**: Configure automatic downloads in Dashboard → Scheduled Tasks
-3. **API Endpoint**: `POST /ThemeSongs/DownloadTVShows` for programmatic access
+3. **API** (admin token): `POST /ThemeSongs/DownloadTVShows[?forceDownload=true]` (202, runs in the background; 409 if running), `POST /ThemeSongs/MoveToStorage`, `GET /ThemeSongs/Status`, `GET|POST|DELETE /ThemeSongs/Series/{id}/Theme`
 
 ## 🎯 How It Works
 
